@@ -165,7 +165,10 @@ import com.metrolist.music.constants.ShufflePlaylistFirstKey
 import com.metrolist.music.constants.SimilarContent
 import com.metrolist.music.constants.SkipSilenceInstantKey
 import com.metrolist.music.constants.SkipSilenceKey
+import com.metrolist.music.constants.SponsorBlockEnabledKey
+import com.metrolist.music.constants.SponsorBlockNotifyOnSkipKey
 import com.metrolist.music.constants.StopMusicOnTaskClearKey
+import com.metrolist.music.constants.enabledSponsorBlockCategories
 import com.metrolist.music.db.MusicDatabase
 import com.metrolist.music.db.entities.Event
 import com.metrolist.music.db.entities.FormatEntity
@@ -209,7 +212,6 @@ import com.metrolist.music.constants.LoudnessLevelKey
 import com.metrolist.music.utils.CoilBitmapLoader
 import com.metrolist.music.utils.NetworkConnectivityObserver
 import com.metrolist.music.utils.ScrobbleManager
-import com.metrolist.music.utils.SyncUtils
 import com.metrolist.music.utils.getArtistSeparator
 import com.metrolist.music.utils.joinToArtistString
 import com.metrolist.music.utils.InnerTubeXPlayer
@@ -220,6 +222,10 @@ import com.metrolist.music.widget.MetrolistWidgetManager
 import com.metrolist.music.widget.MusicWidgetReceiver
 import com.metrolist.music.widget.PlaylistWidgetReceiver
 import com.metrolist.music.ui.utils.resize
+import com.metrolist.sponsorblock.SponsorBlock
+import com.metrolist.sponsorblock.models.Segment
+import com.metrolist.sponsorblock.models.nextSegmentAfter
+import com.metrolist.sponsorblock.models.segmentAt
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CancellationException
 import kotlin.coroutines.coroutineContext
@@ -260,6 +266,15 @@ import java.util.Collections
 private const val INSTANT_SILENCE_SKIP_STEP_MS = 15_000L
 private const val INSTANT_SILENCE_SKIP_SETTLE_MS = 350L
 
+/** How long to wait before re-checking while playback is paused. */
+private const val SPONSORBLOCK_IDLE_POLL_MS = 1_000L
+
+/** Lets an asynchronous seek land before the position is read again. */
+private const val SPONSORBLOCK_POST_SEEK_SETTLE_MS = 200L
+
+/** Floor on the sleep between segments, so the watcher can never spin. */
+private const val SPONSORBLOCK_MIN_WAIT_MS = 250L
+
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @androidx.annotation.OptIn(UnstableApi::class)
 @AndroidEntryPoint
@@ -276,9 +291,6 @@ class MusicService :
 
     @Inject
     lateinit var lyricsHelper: LyricsHelper
-
-    @Inject
-    lateinit var syncUtils: SyncUtils
 
     @Inject
     lateinit var downloadUtil: DownloadUtil
@@ -425,9 +437,19 @@ class MusicService :
 
     private val instantSilenceSkipEnabled = MutableStateFlow(false)
 
+    private var sponsorBlockJob: Job? = null
+    private var sponsorBlockSegments: List<Segment> = emptyList()
+    private var sponsorBlockVideoId: String? = null
+    private var sponsorBlockNotifyOnSkip: Boolean = true
+
+    /**
+     * Set immediately before the watcher's own seek, so the resulting
+     * discontinuity is not mistaken for the user scrubbing.
+     */
+    private var sponsorBlockSelfSeek = false
+
     private var isAudioEffectSessionOpened = false
     private var openedAudioEffectSessionId: Int = C.AUDIO_SESSION_ID_UNSET
-    private val historyReporters = HashMap<Player, YouTubeHistoryReporter>()
     private val playerNormalizationProcessors = HashMap<Player, VolumeNormalizationAudioProcessor>()
     private val playerEqualizerProcessors = HashMap<Player, CustomEqualizerAudioProcessor>()
 
@@ -616,9 +638,11 @@ class MusicService :
         // On some OEMs (e.g. MIUI), even a DataStore read can be slow
         // enough to miss the window, so we promote before any I/O.
         ensureForegroundChannelExists()
-        if (!ensureStartedAsForegroundOrStop()) {
-            return
-        }
+        // Android Auto binds (rather than starts) the service, often while the app is in the
+        // background where startForeground() is denied. That must never skip initialising the
+        // player and session, or the bound client would be left with no session.
+        // onStartCommand re-promotes services that were actually started via startForegroundService().
+        tryEnsureStartedAsForeground()
 
         // Read ALL startup preferences in one shot so that subsequent code
         // never calls dataStore.get() (which does runBlocking internally).
@@ -726,7 +750,6 @@ class MusicService :
             } catch (e: Exception) {
                 Timber.tag(TAG).e(e, "Failed to initialize MediaController")
                 controllerFuture = null
-                stopSelf()
             }
         }, MoreExecutors.directExecutor())
 
@@ -892,6 +915,19 @@ class MusicService :
             }
         }
 
+        // Re-read segments when any SponsorBlock preference changes, so a change
+        // takes effect on the current track instead of only the next one.
+        dataStore.data
+            .map {
+                Triple(
+                    it[SponsorBlockEnabledKey] ?: false,
+                    it.enabledSponsorBlockCategories(),
+                    it[SponsorBlockNotifyOnSkipKey] ?: true,
+                )
+            }
+            .distinctUntilChanged()
+            .collectLatest(scope) { setupSponsorBlock() }
+
         dataStore.data
             .map { (it[SkipSilenceKey] ?: false) to (it[SkipSilenceInstantKey] ?: false) }
             .distinctUntilChanged()
@@ -948,7 +984,6 @@ class MusicService :
             .collectLatest(scope) { (paused, durationMs) ->
                 historyPaused = paused
                 historyDurationMs = durationMs
-                historyReporters.values.forEach { it.refresh() }
             }
 
         var isFirstAudioTrackParamsEmit = true
@@ -1363,30 +1398,7 @@ class MusicService :
                 }
             }
         }
-        val historyReporter = YouTubeHistoryReporter(
-            player = player,
-            // Media3 posts final stats after release, including after the service scope is cancelled.
-            scope = CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main),
-            thresholdMs = { historyDurationMs },
-            isEnabled = { !historyPaused && !YouTube.cookie.isNullOrBlank() },
-            createReport = { videoId ->
-                val account = Triple(YouTube.cookie, YouTube.dataSyncId, YouTube.authUser)
-                val nonce = com.metrolist.innertubex.extraction.generateClientPlaybackNonce()
-                suspend {
-                    withContext(Dispatchers.IO) {
-                        YouTube.registerPlayback(videoId, nonce) {
-                            !dataStore.get(PauseListenHistoryKey, false) &&
-                                account == Triple(YouTube.cookie, YouTube.dataSyncId, YouTube.authUser)
-                        }.onFailure { reportException(it) }
-                            .getOrDefault(false)
-                    }
-                }
-            },
-            onStatsReady = this@MusicService,
-        )
-        historyReporters[player] = historyReporter
-        player.addAnalyticsListener(historyReporter.statsListener)
-        player.addAnalyticsListener(historyReporter.listener)
+        player.addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
 
         // Cleanup handled manually in onDestroy/release
         _playerFlow.value = player
@@ -1600,15 +1612,73 @@ class MusicService :
         player.pause()
     }
 
-    private fun updateNotification(isLiked: Boolean? = currentSong.value?.song?.let { if (it.isEpisode) it.inLibrary != null else it.liked }) {
-        mediaSession?.setCustomLayout(
+    private fun shuffleButton() =
+        CommandButton
+            .Builder()
+            .setDisplayName(getString(if (player.shuffleModeEnabled) R.string.action_shuffle_off else R.string.action_shuffle_on))
+            .setIconResId(if (player.shuffleModeEnabled) R.drawable.shuffle_on else R.drawable.shuffle)
+            .setSessionCommand(CommandToggleShuffle)
+            .build()
+
+    private fun repeatButton() =
+        CommandButton
+            .Builder()
+            .setDisplayName(
+                getString(
+                    when (player.repeatMode) {
+                        REPEAT_MODE_OFF -> R.string.repeat_mode_off
+                        REPEAT_MODE_ONE -> R.string.repeat_mode_one
+                        REPEAT_MODE_ALL -> R.string.repeat_mode_all
+                        else -> throw IllegalStateException()
+                    },
+                ),
+            ).setIconResId(
+                when (player.repeatMode) {
+                    REPEAT_MODE_OFF -> R.drawable.repeat
+                    REPEAT_MODE_ONE -> R.drawable.repeat_one_on
+                    REPEAT_MODE_ALL -> R.drawable.repeat_on
+                    else -> throw IllegalStateException()
+                },
+            ).setSessionCommand(CommandToggleRepeatMode)
+            .build()
+
+    private fun startRadioButton() =
+        CommandButton
+            .Builder()
+            .setDisplayName(getString(R.string.start_radio))
+            .setIconResId(R.drawable.radio)
+            .setSessionCommand(CommandToggleStartRadio)
+            .setEnabled(currentSong.value != null)
+            .build()
+
+    /** Android Auto gets shuffle, repeat and radio only: no likes, library or playlist actions. */
+    fun autoCustomLayout(): List<CommandButton> = listOf(shuffleButton(), repeatButton(), startRadioButton())
+
+    /** Re-applies the layout; [excludedController] is a controller that is disconnecting. */
+    fun refreshLayoutForAutoChange(excludedController: MediaSession.ControllerInfo? = null) {
+        updateNotification(excludedController = excludedController)
+    }
+
+    private fun updateNotification(
+        isLiked: Boolean? = currentSong.value?.song?.let { if (it.isEpisode) it.inLibrary != null else it.liked },
+        excludedController: MediaSession.ControllerInfo? = null,
+    ) {
+        val session = mediaSession ?: return
+        // The platform MediaSessionCompat is shared: Android Auto and the phone's system media
+        // controls read the same PlaybackState, so while Auto is connected the reduced layout
+        // applies to both.
+        val autoConnected =
+            session.connectedControllers.any {
+                it != excludedController &&
+                    (session.isAutoCompanionController(it) || session.isAutomotiveController(it))
+            }
+        if (autoConnected) {
+            session.setCustomLayout(autoCustomLayout())
+            return
+        }
+        session.setCustomLayout(
             listOf(
-                CommandButton
-                    .Builder()
-                    .setDisplayName(getString(if (player.shuffleModeEnabled) R.string.action_shuffle_off else R.string.action_shuffle_on))
-                    .setIconResId(if (player.shuffleModeEnabled) R.drawable.shuffle_on else R.drawable.shuffle)
-                    .setSessionCommand(CommandToggleShuffle)
-                    .build(),
+                shuffleButton(),
                 CommandButton
                     .Builder()
                     .setDisplayName(
@@ -1623,33 +1693,8 @@ class MusicService :
                     .setSessionCommand(CommandToggleLike)
                     .setEnabled(currentSong.value != null)
                     .build(),
-                CommandButton
-                    .Builder()
-                    .setDisplayName(
-                        getString(
-                            when (player.repeatMode) {
-                                REPEAT_MODE_OFF -> R.string.repeat_mode_off
-                                REPEAT_MODE_ONE -> R.string.repeat_mode_one
-                                REPEAT_MODE_ALL -> R.string.repeat_mode_all
-                                else -> throw IllegalStateException()
-                            },
-                        ),
-                    ).setIconResId(
-                        when (player.repeatMode) {
-                            REPEAT_MODE_OFF -> R.drawable.repeat
-                            REPEAT_MODE_ONE -> R.drawable.repeat_one_on
-                            REPEAT_MODE_ALL -> R.drawable.repeat_on
-                            else -> throw IllegalStateException()
-                        },
-                    ).setSessionCommand(CommandToggleRepeatMode)
-                    .build(),
-                CommandButton
-                    .Builder()
-                    .setDisplayName(getString(R.string.start_radio))
-                    .setIconResId(R.drawable.radio)
-                    .setSessionCommand(CommandToggleStartRadio)
-                    .setEnabled(currentSong.value != null)
-                    .build(),
+                repeatButton(),
+                startRadioButton(),
                 CommandButton
                     .Builder()
                     .setDisplayName(getString(R.string.android_auto_target_playlist))
@@ -2177,13 +2222,6 @@ class MusicService :
         scope.launch {
             val songToToggle = currentSong.first()
             songToToggle?.let {
-                val isInLibrary = it.song.inLibrary != null
-                val token = if (isInLibrary) it.song.libraryRemoveToken else it.song.libraryAddToken
-
-                token?.let { feedbackToken ->
-                    YouTube.feedback(listOf(feedbackToken))
-                }
-
                 database.query {
                     update(it.song.toggleLibrary())
                 }
@@ -2204,14 +2242,13 @@ class MusicService :
                     return@let
                 }
 
-                val song = songEntity.toggleLike(syncToYouTube = false)
+                val song = songEntity.toggleLike()
 
                 updateNotification(isLiked = song.liked)
                 updateWidgetUI(player.isPlaying, isLiked = song.liked)
 
                 database.query {
                     update(song)
-                    syncUtils.likeSong(song)
 
                     if (dataStore.get(AutoDownloadOnLikeKey, false) && song.liked) {
                         downloadUtil.download(song.id)
@@ -2272,10 +2309,6 @@ class MusicService :
             )
         }
         currentMediaMetadata.value = player.currentMetadata
-
-        // Sync with YouTube (handles login check internally)
-        val setVideoId = if (isCurrentlySaved) database.getSetVideoId(songEntity.id)?.setVideoId else null
-        syncUtils.saveEpisode(songEntity.id, shouldBeSaved, setVideoId)
     }
 
     fun toggleStartRadio() {
@@ -2309,6 +2342,99 @@ class MusicService :
         } catch (e: Exception) {
             reportException(e)
             processor.enabled = false
+        }
+    }
+
+    /**
+     * Fetches the SponsorBlock segments for the current track and skips past them
+     * as playback reaches each one.
+     *
+     * Rather than polling the player, this sleeps until the next segment is due
+     * and only wakes up when there is something to do, so an idle track costs
+     * nothing. Any earlier watcher is cancelled first, which is what keeps a
+     * stale track's segments from being applied to the new one.
+     */
+    private fun setupSponsorBlock() {
+        sponsorBlockJob?.cancel()
+        sponsorBlockSegments = emptyList()
+        sponsorBlockVideoId = null
+
+        sponsorBlockJob = scope.launch {
+            val videoId = player.currentMediaItem?.mediaId ?: return@launch
+
+            val prefs = dataStore.data.first()
+            if (prefs[SponsorBlockEnabledKey] != true) return@launch
+            val categories = prefs.enabledSponsorBlockCategories()
+            if (categories.isEmpty()) return@launch
+            sponsorBlockNotifyOnSkip = prefs[SponsorBlockNotifyOnSkipKey] ?: true
+
+            val segments = withContext(Dispatchers.IO) {
+                SponsorBlock.getSegments(videoId, categories).getOrElse { throwable ->
+                    Timber.tag(TAG).d(throwable, "SponsorBlock lookup failed for %s", videoId)
+                    emptyList()
+                }
+            }
+            // Most tracks have nothing submitted; leave playback completely alone.
+            if (segments.isEmpty()) return@launch
+
+            sponsorBlockVideoId = videoId
+            sponsorBlockSegments = segments
+            Timber.tag(TAG).d("SponsorBlock: %d segment(s) for %s", segments.size, videoId)
+
+            watchSponsorBlockSegments(videoId, segments)
+        }
+    }
+
+    /**
+     * Restarts the watcher against the segments already in hand.
+     *
+     * A seek or a speed change invalidates the sleep the watcher is sitting in,
+     * because that delay was derived from the old position and rate. Recomputing
+     * it needs no network round trip, so this deliberately reuses the cached
+     * segments rather than calling [setupSponsorBlock].
+     */
+    private fun restartSponsorBlockWatch() {
+        val videoId = sponsorBlockVideoId ?: return
+        val segments = sponsorBlockSegments
+        if (segments.isEmpty()) return
+        if (player.currentMediaItem?.mediaId != videoId) return
+
+        sponsorBlockJob?.cancel()
+        sponsorBlockJob = scope.launch { watchSponsorBlockSegments(videoId, segments) }
+    }
+
+    private suspend fun watchSponsorBlockSegments(videoId: String, segments: List<Segment>) {
+        while (coroutineContext.isActive) {
+            // The track changed under us; the new one gets its own watcher.
+            if (player.currentMediaItem?.mediaId != videoId) return
+
+            if (!player.isPlaying) {
+                delay(SPONSORBLOCK_IDLE_POLL_MS)
+                continue
+            }
+
+            val position = player.currentPosition
+            val current = segments.segmentAt(position)
+            if (current != null) {
+                sponsorBlockSelfSeek = true
+                player.seekTo(current.endMs)
+                if (sponsorBlockNotifyOnSkip) {
+                    Toast.makeText(
+                        this@MusicService,
+                        getString(R.string.sponsorblock_skipped),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                // seekTo is asynchronous; give the player a moment to report
+                // the new position so the next pass does not re-skip.
+                delay(SPONSORBLOCK_POST_SEEK_SETTLE_MS)
+                continue
+            }
+
+            val next = segments.nextSegmentAfter(position) ?: return
+            val speed = player.playbackParameters.speed.coerceAtLeast(0.1f)
+            val waitMs = ((next.startMs - position) / speed).toLong()
+            delay(waitMs.coerceAtLeast(SPONSORBLOCK_MIN_WAIT_MS))
         }
     }
 
@@ -2579,6 +2705,7 @@ class MusicService :
 
         lastPlaybackSpeed = -1.0f // force update song
 
+        setupSponsorBlock()
         setupAudioNormalization()
 
         scrobbleManager?.onSongStop()
@@ -2919,6 +3046,8 @@ class MusicService :
         if (playbackParameters.speed != lastPlaybackSpeed) {
             Timber.tag("DiscordSvc").d("onPlaybackParametersChanged: speed changed %s -> %s", lastPlaybackSpeed, playbackParameters.speed)
             lastPlaybackSpeed = playbackParameters.speed
+            // The pending SponsorBlock wait was scaled by the old speed.
+            restartSponsorBlockWatch()
             DiscordRpcManager.notifySettingsChanged()
             scope.launch {
                 delay(1000)
@@ -4173,14 +4302,16 @@ class MusicService :
     }
 
     /**
-     * [Context.startForegroundService] requires [startForeground] to succeed quickly. If we cannot
-     * enter the foreground state, stop immediately so the system does not ANR the app process.
+     * [Context.startForegroundService] requires [startForeground] to succeed quickly, so this is
+     * attempted before any other initialisation. Failure is tolerated because the service may only
+     * be bound; [onStartCommand] stops started services that still cannot enter the foreground.
      */
-    private fun ensureStartedAsForegroundOrStop(): Boolean =
+    private fun tryEnsureStartedAsForeground(): Boolean =
         startForegroundSafely(
             notification = createFallbackForegroundNotification(),
-            deniedMessage = "Foreground service start not allowed; stopping service to avoid ANR",
-            failureMessage = "Failed to enter foreground; stopping service to avoid ANR",
+            deniedMessage = "Foreground service start not allowed during creation",
+            failureMessage = "Failed to enter foreground during creation",
+            stopOnFailure = false,
         )
 
     private fun ensureForegroundWithLatestNotificationOrStop(): Boolean =
@@ -4812,6 +4943,15 @@ class MusicService :
     ) {
         if (reason == Player.DISCONTINUITY_REASON_SEEK) {
             scheduleCrossfade()
+
+            // Our own skip also lands here. Restarting on it would cancel the
+            // watcher mid-skip and could bounce it straight back into the
+            // segment it just left, so only a user seek recomputes the wait.
+            if (sponsorBlockSelfSeek) {
+                sponsorBlockSelfSeek = false
+            } else {
+                restartSponsorBlockWatch()
+            }
         }
     }
 
@@ -5023,7 +5163,6 @@ class MusicService :
     }
 
     private fun releaseExoPlayer(player: ExoPlayer) {
-        historyReporters.remove(player)?.close()
         playerNormalizationProcessors.remove(player)
         playerSilenceProcessors.remove(player)
         playerEqualizerProcessors.remove(player)?.let(equalizerService::removeAudioProcessor)
@@ -5037,13 +5176,7 @@ class MusicService :
         const val EXTRA_ALARM_RANDOM_SONG = "extra_alarm_random_song"
 
         const val ROOT = "root"
-        const val SONG = "song"
-        const val ARTIST = "artist"
-        const val ALBUM = "album"
-        const val PLAYLIST = "playlist"
-        const val YOUTUBE_PLAYLIST = "youtube_playlist"
         const val SEARCH = "search"
-        const val SHUFFLE_ACTION = "__shuffle__"
 
         const val CHANNEL_ID = "music_channel_01"
         const val NOTIFICATION_ID = 888

@@ -101,7 +101,6 @@ val ProxyUrlKey = stringPreferencesKey("proxyUrl")
 val ProxyTypeKey = stringPreferencesKey("proxyType")
 val ProxyUsernameKey = stringPreferencesKey("proxyUsername")
 val ProxyPasswordKey = stringPreferencesKey("proxyPassword")
-val YtmSyncKey = booleanPreferencesKey("ytmSync")
 val CheckForUpdatesKey = booleanPreferencesKey("checkForUpdates")
 val DismissedStandaloneUpdateKey = stringPreferencesKey("dismissedStandaloneUpdate")
 val DismissedKmpUpdateKey = stringPreferencesKey("dismissedKmpUpdate")
@@ -127,6 +126,17 @@ val ShuffleModeKey = booleanPreferencesKey("shuffleMode")
 val SkipSilenceKey = booleanPreferencesKey("skipSilence")
 val SkipSilenceInstantKey = booleanPreferencesKey("skipSilenceInstant")
 val AudioNormalizationKey = booleanPreferencesKey("audioNormalization")
+
+val SponsorBlockEnabledKey = booleanPreferencesKey("sponsorBlockEnabled")
+val SponsorBlockNotifyOnSkipKey = booleanPreferencesKey("sponsorBlockNotifyOnSkip")
+val SponsorBlockCategorySponsorKey = booleanPreferencesKey("sponsorBlockCategorySponsor")
+val SponsorBlockCategorySelfPromoKey = booleanPreferencesKey("sponsorBlockCategorySelfPromo")
+val SponsorBlockCategoryInteractionKey = booleanPreferencesKey("sponsorBlockCategoryInteraction")
+val SponsorBlockCategoryIntroKey = booleanPreferencesKey("sponsorBlockCategoryIntro")
+val SponsorBlockCategoryOutroKey = booleanPreferencesKey("sponsorBlockCategoryOutro")
+val SponsorBlockCategoryPreviewKey = booleanPreferencesKey("sponsorBlockCategoryPreview")
+val SponsorBlockCategoryFillerKey = booleanPreferencesKey("sponsorBlockCategoryFiller")
+val SponsorBlockCategoryMusicOfftopicKey = booleanPreferencesKey("sponsorBlockCategoryMusicOfftopic")
 
 val LoudnessLevelKey = stringPreferencesKey("loudnessLevel")
 
@@ -264,7 +274,6 @@ val ShowLikedPlaylistKey = booleanPreferencesKey("show_liked_playlist")
 val ShowDownloadedPlaylistKey = booleanPreferencesKey("show_downloaded_playlist")
 val ShowTopPlaylistKey = booleanPreferencesKey("show_top_playlist")
 val ShowCachedPlaylistKey = booleanPreferencesKey("show_cached_playlist")
-val ShowUploadedPlaylistKey = booleanPreferencesKey("show_uploaded_playlist")
 
 enum class LibraryViewType {
     LIST,
@@ -514,17 +523,21 @@ enum class SearchSource {
 }
 
 val VisitorDataKey = stringPreferencesKey("visitorData")
-val DataSyncIdKey = stringPreferencesKey("dataSyncId")
-val InnerTubeAuthUserKey = stringPreferencesKey("innerTubeAuthUser")
-val AndroidAutoYouTubePlaylistsKey = booleanPreferencesKey("androidAutoYoutubePlaylists")
-val AndroidAutoSectionsOrderKey = stringPreferencesKey("androidAutoSectionsOrder")
+
+/** Preference names of the removed YouTube sign-in feature; cleared on start and stripped from restored backups. */
+val LegacyAccountKeyNames =
+    setOf(
+        "innerTubeCookie",
+        "dataSyncId",
+        "innerTubeAuthUser",
+        "accountName",
+        "accountEmail",
+        "accountChannelHandle",
+        "useLoginForBrowse",
+        "ytmSync",
+    )
 val AndroidAutoTargetPlaylistKey = stringPreferencesKey("androidAutoTargetPlaylist")
 val AndroidAutoSearchLocalLimitKey = intPreferencesKey("androidAutoSearchLocalLimit")
-val InnerTubeCookieKey = stringPreferencesKey("innerTubeCookie")
-val AccountNameKey = stringPreferencesKey("accountName")
-val AccountEmailKey = stringPreferencesKey("accountEmail")
-val AccountChannelHandleKey = stringPreferencesKey("accountChannelHandle")
-val UseLoginForBrowse = booleanPreferencesKey("useLoginForBrowse")
 
 val LanguageCodeToName =
     mapOf(
